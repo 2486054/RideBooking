@@ -6,134 +6,189 @@ import com.cts.entity.RideStatus;
 import com.cts.exception.InvalidRideStateException;
 import com.cts.exception.RideNotFoundException;
 import com.cts.exception.UnauthorizedAccessException;
+import com.cts.feign.AuthServiceClient;
 import com.cts.repository.RideRepository;
 import jakarta.transaction.Transactional;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 public class RideService {
 
     private final RideRepository rideRepository;
     private final FareCalculationService fareService;
+    private final AuthServiceClient authServiceClient;
 
-    public RideService(RideRepository rideRepository, FareCalculationService fareService) {
+    public RideService(RideRepository rideRepository,
+                       FareCalculationService fareService,
+                       AuthServiceClient authServiceClient) {
         this.rideRepository = rideRepository;
         this.fareService = fareService;
+        this.authServiceClient = authServiceClient;
     }
 
-    // --- Book a new ride (CUSTOMER) ---
     @Transactional
-    public RideResponse bookRide(BookRideRequest request, Long userId) {
-        Ride ride = new Ride();
-        ride.setUserId(userId);
-        ride.setPickupLocation(request.getPickupLocation());
-        ride.setDropoffLocation(request.getDropoffLocation());
-        ride.setFare(fareService.calculateFare(request.getPickupLocation(), request.getDropoffLocation()));
-        ride.setStatus(RideStatus.REQUESTED);
+    public RideResponse bookRide(BookRideRequest request, String email, String token) {
+        log.info("Booking ride for user: {} from '{}' to '{}'",
+                email, request.getPickupLocation(), request.getDropoffLocation());
+
+        UserResponse user = authServiceClient.getUserByEmail(email, token);
+        log.debug("Fetched user details from Auth Service: userId={}", user.getUserId());
+
+        Ride ride = Ride.builder()
+                .userId(user.getUserId())
+                .pickupLocation(request.getPickupLocation())
+                .dropoffLocation(request.getDropoffLocation())
+                .fare(fareService.calculateFare(request.getPickupLocation(), request.getDropoffLocation()))
+                .status(RideStatus.REQUESTED)
+                .build();
 
         Ride saved = rideRepository.save(ride);
+        log.info("Ride booked successfully: rideId={}, userId={}, fare={}",
+                saved.getRideId(), saved.getUserId(), saved.getFare());
+
         return mapToResponse(saved);
     }
 
-    // --- Assign a driver to a ride (ADMIN) ---
     @Transactional
-    public RideResponse assignDriver(Long rideId, AssignDriverRequest request) {
-        Ride ride = rideRepository.findById(rideId)
-                .orElseThrow(() -> new RideNotFoundException("Ride not found with id: " + rideId));
+    public RideResponse assignDriver(Long rideId, AssignDriverRequest request, String token) {
+        log.info("Admin assigning driver {} to ride {}", request.getDriverId(), rideId);
+
+        Ride ride = findRideOrThrow(rideId);
 
         if (ride.getStatus() != RideStatus.REQUESTED) {
-            throw new InvalidRideStateException("Driver can only be assigned to rides in REQUESTED status");
+            throw new InvalidRideStateException(
+                    "Driver can only be assigned to rides in REQUESTED status");
+        }
+
+        UserResponse driver = authServiceClient.getUserById(request.getDriverId(), token);
+        if (!"DRIVER".equals(driver.getRole().name())) {
+            throw new InvalidRideStateException(
+                    "User " + request.getDriverId() + " is not a DRIVER");
+        }
+
+        // Check if driver already has active rides
+        long activeRides = rideRepository.countActiveRidesByDriver(request.getDriverId());
+        if (activeRides > 0) {
+            throw new InvalidRideStateException(
+                    "Driver " + request.getDriverId() + " already has an active ride");
         }
 
         ride.setDriverId(request.getDriverId());
         ride.setStatus(RideStatus.ACCEPTED);
         Ride updated = rideRepository.save(ride);
+
+        log.info("Driver {} assigned to ride {} successfully", request.getDriverId(), rideId);
         return mapToResponse(updated);
     }
 
-    // --- Accept a ride (DRIVER) ---
     @Transactional
-    public RideResponse acceptRide(Long rideId, Long driverId) {
-        Ride ride = rideRepository.findById(rideId)
-                .orElseThrow(() -> new RideNotFoundException("Ride not found with id: " + rideId));
+    public RideResponse acceptRide(Long rideId, String email, String token) {
+        log.info("Driver {} accepting ride {}", email, rideId);
+
+        Ride ride = findRideOrThrow(rideId);
 
         if (ride.getStatus() != RideStatus.REQUESTED) {
             throw new InvalidRideStateException("Only REQUESTED rides can be accepted");
         }
 
-        ride.setDriverId(driverId);
+        UserResponse driver = authServiceClient.getUserByEmail(email, token);
+
+        // Check if driver already has active rides
+        long activeRides = rideRepository.countActiveRidesByDriver(driver.getUserId());
+        if (activeRides > 0) {
+            throw new InvalidRideStateException("You already have an active ride");
+        }
+
+        ride.setDriverId(driver.getUserId());
         ride.setStatus(RideStatus.ACCEPTED);
         Ride updated = rideRepository.save(ride);
+
+        log.info("Ride {} accepted by driver {} (userId={})", rideId, email, driver.getUserId());
         return mapToResponse(updated);
     }
 
-    // --- Update ride status (DRIVER) ---
     @Transactional
-    public RideResponse updateRideStatus(Long rideId, UpdateRideStatusRequest request, Long driverId) {
-        Ride ride = rideRepository.findById(rideId)
-                .orElseThrow(() -> new RideNotFoundException("Ride not found with id: " + rideId));
+    public RideResponse updateRideStatus(Long rideId, UpdateRideStatusRequest request,
+                                         String email, String token) {
+        log.info("Driver {} updating ride {} status to {}", email, rideId, request.getStatus());
 
-        if (!ride.getDriverId().equals(driverId)) {
+        Ride ride = findRideOrThrow(rideId);
+
+        UserResponse driver = authServiceClient.getUserByEmail(email, token);
+        if (!ride.getDriverId().equals(driver.getUserId())) {
             throw new UnauthorizedAccessException("You are not assigned to this ride");
         }
 
         validateStatusTransition(ride.getStatus(), request.getStatus());
         ride.setStatus(request.getStatus());
         Ride updated = rideRepository.save(ride);
+
+        log.info("Ride {} status updated to {} by driver {}", rideId, request.getStatus(), email);
         return mapToResponse(updated);
     }
 
-    // --- Cancel a ride (CUSTOMER) ---
     @Transactional
-    public RideResponse cancelRide(Long rideId, Long userId) {
-        Ride ride = rideRepository.findById(rideId)
-                .orElseThrow(() -> new RideNotFoundException("Ride not found with id: " + rideId));
+    public RideResponse cancelRide(Long rideId, String email, String token) {
+        log.info("User {} cancelling ride {}", email, rideId);
 
-        if (!ride.getUserId().equals(userId)) {
+        Ride ride = findRideOrThrow(rideId);
+
+        UserResponse user = authServiceClient.getUserByEmail(email, token);
+        if (!ride.getUserId().equals(user.getUserId())) {
             throw new UnauthorizedAccessException("You can only cancel your own rides");
         }
 
         if (ride.getStatus() == RideStatus.COMPLETED || ride.getStatus() == RideStatus.CANCELLED) {
-            throw new InvalidRideStateException("Cannot cancel a ride that is already " + ride.getStatus());
+            throw new InvalidRideStateException(
+                    "Cannot cancel a ride that is already " + ride.getStatus());
         }
 
         ride.setStatus(RideStatus.CANCELLED);
         Ride updated = rideRepository.save(ride);
+
+        log.info("Ride {} cancelled by user {}", rideId, email);
         return mapToResponse(updated);
     }
 
-    // --- Get ride by ID ---
     public RideResponse getRideById(Long rideId) {
-        Ride ride = rideRepository.findById(rideId)
-                .orElseThrow(() -> new RideNotFoundException("Ride not found with id: " + rideId));
+        log.debug("Fetching ride by id: {}", rideId);
+        Ride ride = findRideOrThrow(rideId);
         return mapToResponse(ride);
     }
 
-    // --- Get rides by user ---
     public List<RideResponse> getRidesByUser(Long userId) {
-        return rideRepository.findByUserId(userId)
+        log.debug("Fetching rides for user: {}", userId);
+        return rideRepository.findByUserIdOrderByCreatedAtDesc(userId)
                 .stream().map(this::mapToResponse)
                 .collect(Collectors.toList());
     }
 
-    // --- Get rides by driver ---
     public List<RideResponse> getRidesByDriver(Long driverId) {
-        return rideRepository.findByDriverId(driverId)
+        log.debug("Fetching rides for driver: {}", driverId);
+        return rideRepository.findByDriverIdOrderByCreatedAtDesc(driverId)
                 .stream().map(this::mapToResponse)
                 .collect(Collectors.toList());
     }
 
-    // --- Get all available (REQUESTED) rides for drivers ---
     public List<RideResponse> getAvailableRides() {
+        log.debug("Fetching all available rides");
         return rideRepository.findByStatus(RideStatus.REQUESTED)
                 .stream().map(this::mapToResponse)
                 .collect(Collectors.toList());
     }
 
-    // --- Validate status transitions ---
+    // --- Private Helpers ---
+
+    private Ride findRideOrThrow(Long rideId) {
+        return rideRepository.findById(rideId)
+                .orElseThrow(() -> new RideNotFoundException("Ride not found with id: " + rideId));
+    }
+
     private void validateStatusTransition(RideStatus current, RideStatus next) {
         boolean valid = switch (current) {
             case REQUESTED -> next == RideStatus.ACCEPTED || next == RideStatus.CANCELLED;
@@ -148,18 +203,17 @@ public class RideService {
         }
     }
 
-    // --- Map Entity to Response DTO ---
     private RideResponse mapToResponse(Ride ride) {
-        return new RideResponse(
-                ride.getRideId(),
-                ride.getUserId(),
-                ride.getDriverId(),
-                ride.getPickupLocation(),
-                ride.getDropoffLocation(),
-                ride.getFare(),
-                ride.getStatus(),
-                ride.getCreatedAt(),
-                ride.getUpdatedAt()
-        );
+        return RideResponse.builder()
+                .rideId(ride.getRideId())
+                .userId(ride.getUserId())
+                .driverId(ride.getDriverId())
+                .pickupLocation(ride.getPickupLocation())
+                .dropoffLocation(ride.getDropoffLocation())
+                .fare(ride.getFare())
+                .status(ride.getStatus())
+                .createdAt(ride.getCreatedAt())
+                .updatedAt(ride.getUpdatedAt())
+                .build();
     }
 }
